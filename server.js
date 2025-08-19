@@ -11,9 +11,9 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID;
 const GAS_URL = process.env.GAS_URL;
 
-let userState = {}; // store temporary user progress
+const userState = {}; // store user progress
 
-// ✅ Middleware for allowed user only
+// ✅ Middleware: Only allowed user
 bot.use((ctx, next) => {
   if (ctx.chat && ctx.chat.id.toString() !== ALLOWED_CHAT_ID) {
     return ctx.reply("⛔ You are not authorized to use this bot.");
@@ -21,95 +21,139 @@ bot.use((ctx, next) => {
   return next();
 });
 
-// /start command
+// --- /start command
 bot.start((ctx) => {
   ctx.reply("👋 Send me an Instagram Reel URL to start.");
   userState[ctx.chat.id] = { step: "waiting_reel" };
 });
 
-// Handle messages
+// --- Handle messages
 bot.on("text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
 
   if (!userState[chatId]) userState[chatId] = { step: "waiting_reel" };
-
   const state = userState[chatId];
 
-  if (state.step === "waiting_reel" && text.startsWith("http")) {
-    state.reel = text;
+  // Cancel command
+  if (text.toLowerCase() === "cancel") {
+    delete userState[chatId];
+    return ctx.reply("❌ Cancelled.");
+  }
+
+  // Step: waiting for reel
+  if (state.step === "waiting_reel") {
+    if (!text.startsWith("http")) return ctx.reply("⚠️ Send a valid Instagram Reel URL.");
+    state.reelUrl = text;
     state.step = "waiting_category";
 
-    // fetch categories from GAS
-    const response = await fetch(`${GAS_URL}?action=getCategories`);
-    const data = await response.json();
+    // Fetch categories from GAS
+    try {
+      const res = await fetch(GAS_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "getCategories" }),
+        headers: { "Content-Type": "application/json" },
+      });
+      const data = await res.json();
+      const categories = data.categories || [];
 
-    const categories = data.categories || [];
-    const buttons = categories.map((c) => [Markup.button.callback(c, `cat_${c}`)]);
-    buttons.push([Markup.button.callback("➕ Add Category", "add_category")]);
+      const buttons = categories.map((c) => [Markup.button.callback(c, `cat_${c}`)]);
+      buttons.push([Markup.button.callback("➕ Add Category", "add_category")]);
+      buttons.push([Markup.button.callback("❌ Cancel", "cancel")]);
 
-    ctx.reply("📂 Choose a category:", Markup.inlineKeyboard(buttons));
+      return ctx.reply("📂 Choose a category:", Markup.inlineKeyboard(buttons));
+    } catch (err) {
+      return ctx.reply("⚠️ Failed to fetch categories. Try again later.");
+    }
+  }
+
+  // Step: adding category (waiting for name)
+  if (state.step === "adding_category") {
+    const categoryName = text.trim();
+    if (!categoryName) return ctx.reply("⚠️ Please send a valid category name.");
+
+    try {
+      await fetch(GAS_URL, {
+        method: "POST",
+        body: JSON.stringify({ action: "addCategory", category: categoryName }),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      state.category = categoryName;
+      state.step = "waiting_use_case";
+      return ctx.reply(`✅ Category '${categoryName}' created. Now send the Use Case:`, Markup.inlineKeyboard([
+        [Markup.button.callback("❌ Cancel", "cancel")]
+      ]));
+    } catch (err) {
+      return ctx.reply("⚠️ Failed to create category. Try again.");
+    }
+  }
+
+  // Step: waiting for Use Case
+  if (state.step === "waiting_use_case") {
+    state.useCase = text.trim();
+    state.step = "waiting_extra";
+    return ctx.reply("🔗 Send Extra URL (or type 'no'):", Markup.inlineKeyboard([
+      [Markup.button.callback("❌ Cancel", "cancel")]
+    ]));
+  }
+
+  // Step: waiting for Extra Link
+  if (state.step === "waiting_extra") {
+    state.extraLink = text.toLowerCase() === "no" ? "" : text.trim();
+
+    // Save to Google Sheets
+    try {
+      await fetch(GAS_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "saveReel",
+          category: state.category,
+          reelUrl: state.reelUrl,
+          useCase: state.useCase,
+          extraLink: state.extraLink,
+        }),
+        headers: { "Content-Type": "application/json" },
+      });
+      ctx.reply(`✅ Reel saved in '${state.category}' sheet!`);
+    } catch (err) {
+      ctx.reply("⚠️ Failed to save reel. Try again.");
+    }
+
+    // Reset state
+    userState[chatId] = { step: "waiting_reel" };
+    return ctx.reply("🎬 Send another Reel URL to continue or type /start to restart.");
   }
 });
 
-// Category selection
+// --- Handle button clicks
 bot.action(/cat_(.+)/, (ctx) => {
   const chatId = ctx.chat.id;
   const category = ctx.match[1];
-  userState[chatId].category = category;
-  userState[chatId].step = "waiting_use_case";
-  ctx.reply("✍️ Enter a use case:");
+  const state = userState[chatId];
+  state.category = category;
+  state.step = "waiting_use_case";
+  ctx.reply("✏️ Enter a use case:", Markup.inlineKeyboard([
+    [Markup.button.callback("❌ Cancel", "cancel")]
+  ]));
 });
 
-// Add category
 bot.action("add_category", (ctx) => {
   const chatId = ctx.chat.id;
-  userState[chatId].step = "adding_category";
-  ctx.reply("➕ Send me the new category name:");
-});
-
-// Handle category creation
-bot.on("text", async (ctx) => {
-  const chatId = ctx.chat.id;
   const state = userState[chatId];
-  const text = ctx.message.text;
-
-  if (state.step === "adding_category") {
-    await fetch(GAS_URL, {
-      method: "POST",
-      body: JSON.stringify({ action: "addCategory", name: text }),
-      headers: { "Content-Type": "application/json" },
-    });
-    ctx.reply(`✅ Category '${text}' added! Now send a reel again.`);
-    state.step = "waiting_reel";
-  } else if (state.step === "waiting_use_case") {
-    state.useCase = text;
-    state.step = "waiting_extra_link";
-    ctx.reply("🔗 Any extra link? (or type 'no')");
-  } else if (state.step === "waiting_extra_link") {
-    state.extraLink = text.toLowerCase() === "no" ? "" : text;
-
-    // ✅ Save to Google Sheets
-    await fetch(GAS_URL, {
-      method: "POST",
-      body: JSON.stringify({
-        action: "saveReel",
-        category: state.category,
-        reel: state.reel,
-        useCase: state.useCase,
-        extraLink: state.extraLink,
-      }),
-      headers: { "Content-Type": "application/json" },
-    });
-
-    ctx.reply(`✅ Successfully added to '${state.category}' sheet!`);
-    state.step = "waiting_reel";
-  }
+  state.step = "adding_category";
+  ctx.reply("➕ Send the new category name:", Markup.inlineKeyboard([
+    [Markup.button.callback("❌ Cancel", "cancel")]
+  ]));
 });
 
+bot.action("cancel", (ctx) => {
+  const chatId = ctx.chat.id;
+  delete userState[chatId];
+  ctx.reply("❌ Cancelled.");
+});
+
+// --- Launch bot
 bot.launch();
-
-// Express for Render healthcheck
 app.get("/", (req, res) => res.send("Bot is running ✅"));
-
 app.listen(10000, () => console.log("Server running on port 10000"));
